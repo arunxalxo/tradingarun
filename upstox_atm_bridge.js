@@ -1,5 +1,5 @@
 // upstox_atm_bridge.js
-// TradingView → directional CE/PE → Upstox with trend filter + auto square-off
+// TradingView → directional CE/PE → Upstox with trend filter + auto square-off + fixed 260 qty
 
 require("dotenv").config();
 const express = require("express");
@@ -16,6 +16,7 @@ const UPSTOX_ACCESS_TOKEN = process.env.UPSTOX_ACCESS_TOKEN;
 const DEFAULT_PRODUCT = "I";          // Intraday
 const DEFAULT_VARIETY = "regular";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
+const FIXED_QTY = 260;               // fixed 260 quantity
 
 // ---------------- NOTIFIER ----------------
 async function notify(msg) {
@@ -50,18 +51,15 @@ function isDuplicate(key) {
 function validatePayload(body) {
   if (!body) throw new Error("Empty payload");
 
-  const { action, qty, signalId, timestamp, trend } = body;
+  const { action, signalId, timestamp, trend } = body;
 
   if (!["BUY", "SELL", "SQUAREOFF"].includes(action))
     throw new Error("Invalid action");
 
-  if (action !== "SQUAREOFF" && (!Number.isInteger(qty) || qty <= 0))
-    throw new Error("Invalid qty");
-
   if (!signalId) throw new Error("Missing signalId");
   if (!timestamp) throw new Error("Missing timestamp");
 
-  return { action, qty, signalId, timestamp, trend };
+  return { action, signalId, timestamp, trend };
 }
 
 function applyBusinessRules(p) {
@@ -147,36 +145,23 @@ function verifySignature(req) {
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(hmac));
 }
 
-// ---------------- DIRECTIONAL CE/PE ENGINE ----------------
-function buildLegs({ baseAction, baseQty, spot }) {
+// ---------------- DIRECTIONAL CE/PE ENGINE (FIXED 260 QTY) ----------------
+function buildLegs({ baseAction, spot }) {
   const atm = Math.round(spot / 50) * 50;
   const expiry = getNearestWeeklyExpiry();
 
-  const legs = [];
+  const optionType = baseAction === "BUY" ? "CE" : "PE";
+  const label = baseAction === "BUY" ? "ATM_CE" : "ATM_PE";
 
-  if (baseAction === "BUY") {
-    legs.push({
-      label: "ATM_CE",
-      action: "BUY",
-      strike: atm,
-      optionType: "CE",
-      qty: baseQty,
-    });
-  } else {
-    legs.push({
-      label: "ATM_PE",
-      action: "BUY",
-      strike: atm,
-      optionType: "PE",
-      qty: baseQty,
-    });
-  }
-
-  return legs.map((leg) => ({
-    ...leg,
+  return [{
+    label,
+    action: "BUY",
+    strike: atm,
+    optionType,
+    qty: FIXED_QTY,
     expiry,
-    symbol: `NIFTY${expiry}${leg.strike}${leg.optionType}`,
-  }));
+    symbol: `NIFTY${expiry}${atm}${optionType}`,
+  }];
 }
 
 // ---------------- AUTO SQUARE-OFF ----------------
@@ -236,7 +221,6 @@ app.post("/tv-webhook", async (req, res) => {
 
     const legs = buildLegs({
       baseAction: payload.action,
-      baseQty: payload.qty,
       spot,
     });
 
@@ -253,7 +237,7 @@ app.post("/tv-webhook", async (req, res) => {
     }
 
     await notify(
-      `✅ *Directional CE/PE Order*\n` +
+      `✅ *Directional CE/PE Order (Fixed 260)*\n` +
       legs.map((l) => `${l.label}: ${l.action} ${l.symbol} x ${l.qty}`).join("\n")
     );
 
@@ -267,4 +251,4 @@ app.post("/tv-webhook", async (req, res) => {
 });
 
 // ---------------- SERVER ----------------
-app.listen(PORT, () => console.log(`ATM Directional Bridge running on ${PORT}`));
+app.listen(PORT, () => console.log(`ATM Directional Bridge (260 qty) running on ${PORT}`));

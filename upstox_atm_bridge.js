@@ -1,5 +1,6 @@
 // upstox_atm_bridge.js
-// TradingView → directional CE/PE → Upstox with trend filter + auto square-off + fixed 260 qty
+// TradingView → directional CE/PE → Upstox
+// Features: trend filter, fixed 260 qty, 10% SL/TP, re-entry block, max trades/day, auto square-off
 
 require("dotenv").config();
 const express = require("express");
@@ -16,7 +17,12 @@ const UPSTOX_ACCESS_TOKEN = process.env.UPSTOX_ACCESS_TOKEN;
 const DEFAULT_PRODUCT = "I";          // Intraday
 const DEFAULT_VARIETY = "regular";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
-const FIXED_QTY = 260;               // FIXED 260 QUANTITY
+const FIXED_QTY = 260;               // fixed 260 quantity
+
+// ---------------- STATE ----------------
+let openPosition = null;             // current CE/PE position
+let tradesToday = 0;
+const MAX_TRADES = 3;
 
 // ---------------- NOTIFIER ----------------
 async function notify(msg) {
@@ -206,9 +212,19 @@ app.post("/tv-webhook", async (req, res) => {
     // Auto square-off
     if (payload.action === "SQUAREOFF") {
       await squareOffAllPositions();
+      openPosition = null;
+      tradesToday = 0;
       await notify("🔁 Auto Square-off executed");
       return res.json({ status: "ok", message: "Square-off completed" });
     }
+
+    // Re-entry prevention
+    if (openPosition)
+      throw new Error("Rejected: Position already open (Re-entry blocked)");
+
+    // Max trades per day
+    if (tradesToday >= MAX_TRADES)
+      throw new Error("Rejected: Max trades for the day reached");
 
     // Trend filter enforcement
     if (payload.action === "BUY" && payload.trend !== "BULL")
@@ -233,6 +249,18 @@ app.post("/tv-webhook", async (req, res) => {
         qty: leg.qty,
         instrumentToken: token,
       });
+
+      // store position with 10% SL/TP
+      openPosition = {
+        symbol: leg.symbol,
+        instrumentToken: token,
+        qty: leg.qty,
+        entryPrice: result.price || 0,
+        slPrice: (result.price || 0) * 0.90,  // 10% SL
+        tpPrice: (result.price || 0) * 1.10,  // 10% TP
+      };
+
+      tradesToday++;
       results.push({ leg: leg.label, symbol: leg.symbol, result });
     }
 
@@ -250,5 +278,46 @@ app.post("/tv-webhook", async (req, res) => {
   }
 });
 
+// ---------------- SL/TP MONITOR (10% UP/DOWN) ----------------
+setInterval(async () => {
+  if (!openPosition) return;
+
+  try {
+    const url = `${UPSTOX_BASE_URL}/market-quote/ltp?symbol=${encodeURIComponent(openPosition.symbol)}`;
+    const res = await axios.get(url, {
+      headers: { Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}` },
+    });
+
+    const ltp = res.data.data[Object.keys(res.data.data)[0]].last_price;
+
+    // SL HIT (10% down)
+    if (ltp <= openPosition.slPrice) {
+      await placeOrder({
+        action: "SELL",
+        qty: openPosition.qty,
+        instrumentToken: openPosition.instrumentToken,
+      });
+      await notify(`❌ SL Hit (10% down) → Exited ${openPosition.symbol} at ${ltp}`);
+      openPosition = null;
+      return;
+    }
+
+    // TP HIT (10% up)
+    if (ltp >= openPosition.tpPrice) {
+      await placeOrder({
+        action: "SELL",
+        qty: openPosition.qty,
+        instrumentToken: openPosition.instrumentToken,
+      });
+      await notify(`🎯 TP Hit (10% up) → Exited ${openPosition.symbol} at ${ltp}`);
+      openPosition = null;
+      return;
+    }
+
+  } catch (err) {
+    console.error("SL/TP monitor error:", err.message);
+  }
+}, 1000);
+
 // ---------------- SERVER ----------------
-app.listen(PORT, () => console.log(`ATM Directional Bridge (260 qty) running on ${PORT}`));
+app.listen(PORT, () => console.log(`ATM Directional Bridge (260 qty, 10% SL/TP) running on ${PORT}`));

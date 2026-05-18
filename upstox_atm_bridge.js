@@ -1,5 +1,5 @@
 // upstox_atm_bridge.js
-// One-file TradingView → ATM CE/PE → Upstox order bridge
+// TradingView → directional CE/PE → Upstox with trend filter + auto square-off
 
 require("dotenv").config();
 const express = require("express");
@@ -13,7 +13,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const UPSTOX_BASE_URL = "https://api.upstox.com/v2";
 const UPSTOX_ACCESS_TOKEN = process.env.UPSTOX_ACCESS_TOKEN;
-const DEFAULT_PRODUCT = "I";
+const DEFAULT_PRODUCT = "I";          // Intraday
 const DEFAULT_VARIETY = "regular";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 
@@ -50,14 +50,18 @@ function isDuplicate(key) {
 function validatePayload(body) {
   if (!body) throw new Error("Empty payload");
 
-  const { action, qty, signalId, timestamp } = body;
+  const { action, qty, signalId, timestamp, trend } = body;
 
-  if (!["BUY", "SELL"].includes(action)) throw new Error("Invalid action");
-  if (!Number.isInteger(qty) || qty <= 0) throw new Error("Invalid qty");
+  if (!["BUY", "SELL", "SQUAREOFF"].includes(action))
+    throw new Error("Invalid action");
+
+  if (action !== "SQUAREOFF" && (!Number.isInteger(qty) || qty <= 0))
+    throw new Error("Invalid qty");
+
   if (!signalId) throw new Error("Missing signalId");
   if (!timestamp) throw new Error("Missing timestamp");
 
-  return { action, qty, signalId, timestamp };
+  return { action, qty, signalId, timestamp, trend };
 }
 
 function applyBusinessRules(p) {
@@ -143,6 +147,65 @@ function verifySignature(req) {
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(hmac));
 }
 
+// ---------------- DIRECTIONAL CE/PE ENGINE ----------------
+function buildLegs({ baseAction, baseQty, spot }) {
+  const atm = Math.round(spot / 50) * 50;
+  const expiry = getNearestWeeklyExpiry();
+
+  const legs = [];
+
+  if (baseAction === "BUY") {
+    legs.push({
+      label: "ATM_CE",
+      action: "BUY",
+      strike: atm,
+      optionType: "CE",
+      qty: baseQty,
+    });
+  } else {
+    legs.push({
+      label: "ATM_PE",
+      action: "BUY",
+      strike: atm,
+      optionType: "PE",
+      qty: baseQty,
+    });
+  }
+
+  return legs.map((leg) => ({
+    ...leg,
+    expiry,
+    symbol: `NIFTY${expiry}${leg.strike}${leg.optionType}`,
+  }));
+}
+
+// ---------------- AUTO SQUARE-OFF ----------------
+async function squareOffAllPositions() {
+  try {
+    const pos = await axios.get(
+      `${UPSTOX_BASE_URL}/portfolio/positions`,
+      { headers: { Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}` } }
+    );
+
+    const positions = pos.data.data || [];
+
+    for (const p of positions) {
+      if (!p.trading_symbol || !p.trading_symbol.includes("NIFTY")) continue;
+      if (!p.net_qty || p.net_qty === 0) continue;
+
+      const exitAction = p.net_qty > 0 ? "SELL" : "BUY";
+
+      await placeOrder({
+        action: exitAction,
+        qty: Math.abs(p.net_qty),
+        instrumentToken: p.instrument_token,
+      });
+    }
+  } catch (err) {
+    console.error("Square-off error:", err.message);
+  }
+}
+
 // ---------------- MAIN HANDLER ----------------
 app.post("/tv-webhook", async (req, res) => {
   try {
@@ -155,29 +218,54 @@ app.post("/tv-webhook", async (req, res) => {
 
     const payload = applyBusinessRules(base);
 
+    // Auto square-off
+    if (payload.action === "SQUAREOFF") {
+      await squareOffAllPositions();
+      await notify("🔁 Auto Square-off executed");
+      return res.json({ status: "ok", message: "Square-off completed" });
+    }
+
+    // Trend filter enforcement
+    if (payload.action === "BUY" && payload.trend !== "BULL")
+      throw new Error("Rejected: Not in bullish trend");
+
+    if (payload.action === "SELL" && payload.trend !== "BEAR")
+      throw new Error("Rejected: Not in bearish trend");
+
     const spot = await getNiftyLTP();
-    const atm = Math.round(spot / 50) * 50;
 
-    const optionType = payload.action === "BUY" ? "CE" : "PE";
-    const expiry = getNearestWeeklyExpiry();
-    const symbol = `NIFTY${expiry}${atm}${optionType}`;
-
-    const token = await getInstrumentToken(symbol);
-
-    const result = await placeOrder({
-      action: payload.action,
-      qty: payload.qty,
-      instrumentToken: token,
+    const legs = buildLegs({
+      baseAction: payload.action,
+      baseQty: payload.qty,
+      spot,
     });
 
-    notify(`ATM Order → ${symbol}\n${JSON.stringify(result)}`);
-    res.json({ status: "ok", symbol, result });
+    const results = [];
+
+    for (const leg of legs) {
+      const token = await getInstrumentToken(leg.symbol);
+      const result = await placeOrder({
+        action: leg.action,
+        qty: leg.qty,
+        instrumentToken: token,
+      });
+      results.push({ leg: leg.label, symbol: leg.symbol, result });
+    }
+
+    await notify(
+      `✅ *Directional CE/PE Order*\n` +
+      legs.map((l) => `${l.label}: ${l.action} ${l.symbol} x ${l.qty}`).join("\n")
+    );
+
+    res.json({ status: "ok", legs: results });
 
   } catch (err) {
-    notify(`Error: ${err.message}`);
+    console.error("Error:", err.message);
+    await notify(`❌ Error: ${err.message}`);
     res.status(400).json({ error: err.message });
   }
 });
 
 // ---------------- SERVER ----------------
-app.listen(PORT, () => console.log(`ATM Bridge running on ${PORT}`));
+app.listen(PORT, () => console.log(`ATM Directional Bridge running on ${PORT}`));
+

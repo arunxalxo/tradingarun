@@ -1,2 +1,13 @@
-.env
-node_modules/
+# Required for live trading
+UPSTOX_ACCESS_TOKEN=your_upstox_access_token
+
+# Telegram notifications
+TELEGRAM_BOT_TOKEN=123456:ABCDEF...
+TELEGRAM_CHAT_ID=987654321
+
+# Optional
+WEBHOOK_SECRET=your_webhook_secret_here
+FIXED_QTY=260
+MAX_TRADES=3
+DRY_RUN=true
+PORT=3000

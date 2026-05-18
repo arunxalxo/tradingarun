@@ -16,7 +16,7 @@ const UPSTOX_ACCESS_TOKEN = process.env.UPSTOX_ACCESS_TOKEN;
 const DEFAULT_PRODUCT = "I";          // Intraday
 const DEFAULT_VARIETY = "regular";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
-const FIXED_QTY = 260;               // fixed 260 quantity
+const FIXED_QTY = 260;               // FIXED 260 QUANTITY
 
 // ---------------- NOTIFIER ----------------
 async function notify(msg) {

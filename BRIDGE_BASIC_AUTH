@@ -1,0 +1,2 @@
+echo -n "username:password" | base64
+# paste the output into BRIDGE_BASIC_AUTH

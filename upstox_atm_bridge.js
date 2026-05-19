@@ -1,4 +1,4 @@
-// upstox_orb_vstop_bridge_dryrun.js
+// upstox_ai_bridge.js
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -15,20 +15,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 
-const DEFAULT_PRODUCT = "I";
-const DEFAULT_VARIETY = "regular";
 const FIXED_QTY = Number(process.env.FIXED_QTY || 260);
 const MAX_TRADES = Number(process.env.MAX_TRADES || 3);
 const DRY_RUN = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
-
-// ---------------- STARTUP CHECK ----------------
-const missing = [];
-if (!UPSTOX_ACCESS_TOKEN && !DRY_RUN) missing.push("UPSTOX_ACCESS_TOKEN");
-if (!TELEGRAM_BOT_TOKEN) missing.push("TELEGRAM_BOT_TOKEN");
-if (!TELEGRAM_CHAT_ID) missing.push("TELEGRAM_CHAT_ID");
-if (missing.length) {
-  console.warn("Missing environment variables (some may be optional in dry-run):", missing.join(", "));
-}
 
 // ---------------- STATE ----------------
 let openPosition = null;
@@ -42,10 +31,11 @@ async function notify(msg) {
     return;
   }
   try {
-    await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      { chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: "Markdown" }
-    );
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: msg,
+      parse_mode: "Markdown",
+    });
   } catch (e) {
     console.error("Notifier error:", e.message);
   }
@@ -62,15 +52,25 @@ function isDuplicate(key) {
   return false;
 }
 
+// ---------------- HMAC VERIFY ----------------
+function verifySignature(req) {
+  if (!WEBHOOK_SECRET) return true;
+  const sig = req.headers["x-webhook-signature"];
+  if (!sig) return false;
+  const body = JSON.stringify(req.body);
+  const hmac = crypto.createHmac("sha256", WEBHOOK_SECRET).update(body).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(hmac));
+}
+
 // ---------------- VALIDATION ----------------
 function validatePayload(body) {
   if (!body) throw new Error("Empty payload");
-  const { action, signalId, timestamp, trend, symbol, volatility } = body;
+  const { action, signalId, timestamp, trend, symbol, volatility, oi, ema } = body;
   if (!["BUY", "SELL", "SQUAREOFF"].includes(action)) throw new Error("Invalid action");
   if (!signalId) throw new Error("Missing signalId");
   if (!timestamp) throw new Error("Missing timestamp");
   if (!symbol) throw new Error("Missing symbol");
-  return { action, signalId, timestamp, trend, symbol, volatility };
+  return { action, signalId, timestamp, trend, symbol, volatility, oi, ema };
 }
 
 function applyBusinessRules(p) {
@@ -107,28 +107,13 @@ async function placeOrder({ action, qty, instrumentToken }) {
   if (DRY_RUN) {
     const simulated = {
       status: "DRY_RUN",
-      data: {
-        order_id: `DRY_${Date.now()}`,
-        instrument_token: instrumentToken,
-        transaction_type: action,
-        quantity: qty,
-        average_price: null
-      }
+      data: { order_id: `DRY_${Date.now()}`, instrument_token: instrumentToken, transaction_type: action, quantity: qty, average_price: null }
     };
     console.log("[DRY_RUN] Simulated placeOrder:", simulated);
     return simulated;
   }
-  const payload = {
-    transaction_type: action,
-    quantity: qty,
-    product: DEFAULT_PRODUCT,
-    order_type: "MARKET",
-    instrument_token: instrumentToken,
-    variety: DEFAULT_VARIETY,
-  };
-  const res = await axios.post(`${UPSTOX_BASE_URL}/order/place`, payload, {
-    headers: { Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}`, "Content-Type": "application/json" },
-  });
+  const payload = { transaction_type: action, quantity: qty, product: "I", order_type: "MARKET", instrument_token: instrumentToken, variety: "regular" };
+  const res = await axios.post(`${UPSTOX_BASE_URL}/order/place`, payload, { headers: { Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}`, "Content-Type": "application/json" } });
   return res.data;
 }
 
@@ -159,16 +144,6 @@ async function squareOffAllPositions() {
   }
 }
 
-// ---------------- HMAC VERIFY ----------------
-function verifySignature(req) {
-  if (!WEBHOOK_SECRET) return true;
-  const sig = req.headers["x-webhook-signature"];
-  if (!sig) return false;
-  const body = JSON.stringify(req.body);
-  const hmac = crypto.createHmac("sha256", WEBHOOK_SECRET).update(body).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(hmac));
-}
-
 // ---------------- MAIN HANDLER ----------------
 app.post("/tv-webhook", async (req, res) => {
   try {
@@ -186,23 +161,39 @@ app.post("/tv-webhook", async (req, res) => {
     if (openPosition) throw new Error("Rejected: Position already open (Re-entry blocked)");
     if (tradesToday >= MAX_TRADES) throw new Error("Rejected: Max trades for the day reached");
 
-    if (payload.action === "BUY" && payload.trend && payload.trend !== "BULL") throw new Error("Rejected: Not in bullish trend");
-    if (payload.action === "SELL" && payload.trend && payload.trend !== "BEAR") throw new Error("Rejected: Not in bearish trend");
+    // Trend / EMA enforcement
+    if (payload.ema) {
+      if (payload.action === "BUY" && payload.ema !== "EMA_BULL") throw new Error("Rejected: EMA structure not bullish");
+      if (payload.action === "SELL" && payload.ema !== "EMA_BEAR") throw new Error("Rejected: EMA structure not bearish");
+    }
 
+    // Volatility enforcement
     if (payload.volatility) {
       if (payload.action === "BUY" && payload.volatility !== "UPTREND") throw new Error("Rejected: Volatility Stop not in uptrend");
       if (payload.action === "SELL" && payload.volatility !== "DOWNTREND") throw new Error("Rejected: Volatility Stop not in downtrend");
     }
 
+    // Optional Open Interest sanity check (if provided)
+    if (payload.oi && payload.oi !== "NA") {
+      const oiVal = Number(payload.oi);
+      if (!Number.isNaN(oiVal)) {
+        // simple rule: require OI > 0 for futures/options signals (tunable)
+        if (oiVal <= 0) throw new Error("Rejected: Open Interest too low");
+      }
+    }
+
+    // Build option symbol: nearest weekly expiry and ATM strike (rounded to 50)
     const spot = await getNiftyLTP();
     const atm = Math.round(spot / 50) * 50;
     const expiry = getNearestWeeklyExpiry();
     const optionType = payload.action === "BUY" ? "CE" : "PE";
     const symbol = `NIFTY${expiry}${atm}${optionType}`;
 
+    // Place order (or simulate)
     const token = await getInstrumentToken(symbol);
     const orderRes = await placeOrder({ action: "BUY", qty: FIXED_QTY, instrumentToken: token });
 
+    // Determine entry price
     let entryPrice = 0;
     if (DRY_RUN) {
       try {
@@ -221,15 +212,8 @@ app.post("/tv-webhook", async (req, res) => {
       }
     }
 
-    openPosition = {
-      symbol,
-      instrumentToken: token,
-      qty: FIXED_QTY,
-      entryPrice,
-      slPrice: entryPrice * 0.90,
-      tpPrice: entryPrice * 1.10,
-    };
-
+    // Store open position with 10% SL/TP
+    openPosition = { symbol, instrumentToken: token, qty: FIXED_QTY, entryPrice, slPrice: entryPrice * 0.90, tpPrice: entryPrice * 1.10 };
     tradesToday++;
     const msg = `${DRY_RUN ? "✅ [DRY_RUN] Simulated entry" : "✅ Entered"} ${payload.action} → ${symbol} x ${FIXED_QTY}\nEntry: ${entryPrice}\nSL: ${openPosition.slPrice}\nTP: ${openPosition.tpPrice}`;
     console.log(msg);
@@ -243,19 +227,7 @@ app.post("/tv-webhook", async (req, res) => {
   }
 });
 
-// ---------------- UTILS ----------------
-function getNearestWeeklyExpiry() {
-  const today = new Date();
-  const day = today.getDay();
-  const diff = day <= 4 ? 4 - day : 11 - day;
-  const expiry = new Date(today);
-  expiry.setDate(today.getDate() + diff);
-  const dd = String(expiry.getDate()).padStart(2, "0");
-  const mon = expiry.toLocaleString("en-US", { month: "short" }).toUpperCase();
-  return `${dd}${mon}`;
-}
-
-// ---------------- SL/TP MONITOR (every second) ----------------
+// ---------------- SL/TP MONITOR ----------------
 setInterval(async () => {
   if (!openPosition) return;
   try {
@@ -303,5 +275,17 @@ setInterval(async () => {
   }
 }, 1000);
 
+// ---------------- UTILS ----------------
+function getNearestWeeklyExpiry() {
+  const today = new Date();
+  const day = today.getDay();
+  const diff = day <= 4 ? 4 - day : 11 - day;
+  const expiry = new Date(today);
+  expiry.setDate(today.getDate() + diff);
+  const dd = String(expiry.getDate()).padStart(2, "0");
+  const mon = expiry.toLocaleString("en-US", { month: "short" }).toUpperCase();
+  return `${dd}${mon}`;
+}
+
 // ---------------- SERVER ----------------
-app.listen(PORT, () => console.log(`ORB VStop Bridge running on ${PORT} (DRY_RUN=${DRY_RUN})`));
+app.listen(PORT, () => console.log(`AI ORB Bridge running on ${PORT} (DRY_RUN=${DRY_RUN})`));

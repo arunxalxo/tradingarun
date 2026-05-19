@@ -1,0 +1,53 @@
+// tv_alert_forwarder.js
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const crypto = require('crypto');
+
+const app = express();
+app.use(express.json({ limit: '200kb' }));
+
+const PORT = Number(process.env.FORWARDER_PORT || 4000);
+const BRIDGE_URL = process.env.BRIDGE_URL;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const MAX_RETRIES = Number(process.env.FORWARDER_MAX_RETRIES || 2);
+const RETRY_DELAY_MS = Number(process.env.FORWARDER_RETRY_DELAY_MS || 1000);
+
+if (!BRIDGE_URL) {
+  console.error('Set BRIDGE_URL in .env');
+  process.exit(1);
+}
+
+function computeHmac(bodyString, secret) {
+  return crypto.createHmac('sha256', secret).update(bodyString).digest('hex');
+}
+
+async function forwardToBridge(bodyString) {
+  const signature = computeHmac(bodyString, WEBHOOK_SECRET);
+  const headers = { 'Content-Type': 'application/json', 'x-webhook-signature': signature };
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const res = await axios.post(BRIDGE_URL, bodyString, { headers, timeout: 10000 });
+      return { ok: true, status: res.status, data: res.data };
+    } catch (err) {
+      if (attempt < MAX_RETRIES) await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+      else return { ok: false, error: err.message };
+    }
+  }
+}
+
+app.post('/forward', async (req, res) => {
+  try {
+    const bodyObj = req.body;
+    const bodyString = JSON.stringify(bodyObj);
+    const result = await forwardToBridge(bodyString);
+    if (!result.ok) return res.status(502).json({ status: 'error', detail: result });
+    return res.json({ status: 'forwarded', bridgeStatus: result.status, bridgeResponse: result.data });
+  } catch (err) {
+    return res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+app.listen(PORT, () => console.log(`Alert forwarder listening on ${PORT}, forwarding to ${BRIDGE_URL}`));
